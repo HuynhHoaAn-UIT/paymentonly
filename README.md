@@ -1,21 +1,46 @@
-# ShopSphere Payment-only Demo (AWS)
+# ShopSphere QR Scan-to-Success Payment Demo
 
-Minimal **S3 static frontend + ALB + 1 ECS Fargate task (2 containers: API and Worker) + RDS MySQL Multi-AZ**. No CloudFront, Auth, Product, Cart, Order services.
+**Educational simulation — no money moves.** Based on the existing ShopSphere product + checkout frontend. No MoMo/VNPay or other gateway. Opening a QR link changes the payment to SCANNED, then the separate Payment Worker changes it to SUCCEEDED in MySQL.
 
-## Source of payment backend
+## Architecture
+- `frontend/` static HTML/CSS/JS (S3 website compatible)
+- `payment-api`: Spring Boot Java 17, creates payment and QR SVG, accepts scan, exposes status
+- `payment-worker`: same image with `APP_ROLE=worker`, polls MySQL SCANNED -> SUCCEEDED
+- MySQL locally / RDS MySQL Multi-AZ on AWS
+- One ECS cluster, one ECS service, one Fargate task with two containers
 
-The original Java 17 Spring Boot backend is **not bundled** in this archive. Copy **the complete `Payment_Service/` directory** from https://github.com/PhuSon26/ShopSphere_E-Commerce/tree/main/Payment_Service into this repository as `payment/`. Do not copy other services or the original frontend. The original payment API has `POST /api/v1/payments`, `GET /api/v1/payments/{paymentId}`, `APP_ROLE=api|worker`, and `/actuator/health`. See `docs/DEPLOY.md`.
+## Quick start (Windows PowerShell)
+```powershell
+git clone https://github.com/HuynhHoaAn-UIT/paymentonly.git
+cd paymentonly
+Copy-Item .env.example .env
+notepad .env
+docker compose up -d --build
+docker compose ps
+curl.exe http://localhost:8084/actuator/health
+cd frontend
+py -m http.server 5500
+```
+Open http://localhost:5500, choose mouse, Checkout, Tạo mã QR. On phone **open** scanned URL. Desktop polls and shows success.
 
-**Check the actual payment response DTO:** `frontend/app.js` assumes the returned identifier is `paymentId` or `id`, and status is `status`. Adapt to the actual DTO if needed. The original payment worker must be running or a pending payment will not advance.
+**Phone networking:** `PUBLIC_API_BASE_URL=http://localhost:8084` does not work on a different phone (localhost refers to the phone). For phones on same Wi-Fi change `PUBLIC_API_BASE_URL` in `.env` to `http://YOUR_PC_LAN_IP:8084`, allow TCP 8084 from LAN only in Windows Firewall, then `docker compose up -d --force-recreate payment-api payment-worker`. The desktop frontend `PAYMENT_API_BASE` can remain localhost. For remote scanning use HTTPS ALB or a controlled HTTPS tunnel.
 
-## Files
-- `frontend/index.html`: one product, pay button, status.
-- `frontend/config.js`: set public ALB origin URL.
-- `frontend/app.js`: create payment with Idempotency-Key, poll status, show MoMo checkout link.
-- `docs/DEPLOY.md`: AWS setup, network, security, failover test and monitoring.
+## API
+POST `/api/v1/payments`, header `Idempotency-Key`, JSON:
+```json
+{"orderId":"demo-1001","amount":125000,"currency":"VND","method":"QR_DEMO"}
+```
+Returns HTTP 202 with `paymentId`, `status`, `qrCodeUrl`, `expiresAt`.
+GET `/api/v1/payments/{id}` returns PENDING/SCANNED/SUCCEEDED/EXPIRED.
+GET QR SVG `/{id}/qr?token=...`; embedded QR URL `/scan/{token}`.
 
-## Important limitations
-- This is a **deployment scaffold, not a tested end-to-end MoMo integration**. MoMo sandbox partner credentials and public HTTPS callback URL are required.
-- The frontend **opens the MoMo-hosted checkout**, where MoMo displays its payment UI/QR; it does not fabricate a QR or mark payment succeeded locally.
-- S3 static website hosting is HTTP only; use it for a controlled lab, not production checkout. The public ALB may need an HTTPS listener with a real domain/certificate, depending on MoMo callback requirements. S3 HTTP -> HTTPS ALB is allowed by browsers but CORS must be configured in the API.
-- One ECS task is not high availability. RDS Multi-AZ protects the DB tier only.
+## Build two tags from one Dockerfile
+```powershell
+docker build -t hoaaanhuynh/nt533:api -t hoaaanhuynh/nt533:worker ./payment
+docker push hoaaanhuynh/nt533:api
+docker push hoaaanhuynh/nt533:worker
+```
+The API and Worker are **two separate containers** running the same image with different `APP_ROLE` variables.
+
+## Important
+**Scanning/opening a URL is NOT proof of a real transfer.** Link preview bots can auto-open QR URLs. Do not use this implementation for accepting money or fulfilling paid orders. QR is valid for 10 minutes. Idempotent POST replays return the original transaction but do not re-expose the token. `ddl-auto=update` is only for lab. AWS RDS Multi-AZ provides DB failover, not uninterrupted request processing. See `docs/DEPLOY.md`.
