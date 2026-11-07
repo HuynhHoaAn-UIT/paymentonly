@@ -1,67 +1,92 @@
 const $ = id => document.getElementById(id);
-const apiBase = (window.PAYMENT_API_BASE || '').replace(/\/$/, '');
-const mock = window.DEMO_MODE === true;
-let paymentId = null;
+const base = (window.PAYMENT_API_BASE || '').replace(/\/$/, '');
 let timer = null;
-let currentOrderId = null;
+let generation = 0;
 
-function showPage(name) {
-  $('products-page').hidden = name !== 'products';
-  $('checkout-page').hidden = name !== 'checkout';
-  location.hash = name;
-  window.scrollTo(0, 0);
+function page(which){
+  $('products-page').hidden = which !== 'products';
+  $('checkout-page').hidden = which !== 'checkout';
+  location.hash = which;
+  window.scrollTo(0,0);
 }
-function setStatus(message) { $('status').textContent = message; }
-function resetCheckout() {
-  clearTimeout(timer); paymentId = null; currentOrderId = null;
-  $('pay').disabled = false; $('pay').textContent = 'Thanh toán bằng MoMo';
-  $('checkout').replaceChildren(); $('mock-controls').hidden = true;
-  $('note').textContent = mock ? 'Đang ở chế độ mô phỏng giao diện; chưa kết nối MoMo.' : 'Đang kết nối Payment API.';
-  setStatus('Chưa thanh toán');
+function status(message){$('status').textContent=message;}
+function reset(){
+  generation++;
+  clearTimeout(timer);
+  $('pay').disabled=false;
+  $('pay').textContent='Tạo mã QR thanh toán';
+  $('qr-area').hidden=true;
+  $('payment-qr').removeAttribute('src');
+  $('checkout').replaceChildren();
+  $('note').textContent='Quét QR chỉ mô phỏng thanh toán, không chuyển tiền thật.';
+  status('Chưa thanh toán');
 }
-$('buy-btn').addEventListener('click', () => { resetCheckout(); $('cart-count').textContent = '1'; showPage('checkout'); });
-$('back-btn').addEventListener('click', () => { clearTimeout(timer); $('cart-count').textContent = '0'; showPage('products'); });
-$('mock-success').addEventListener('click', () => { $('mock-controls').hidden = true; setStatus('✅ Thanh toán thành công (MOCK UI)'); $('pay').disabled = false; $('pay').textContent = 'Tạo giao dịch mới'; });
-
-async function parseResponse(response) {
-  const body = await response.text();
-  let data; try { data = JSON.parse(body); } catch { throw new Error(body || `HTTP ${response.status}`); }
-  if (!response.ok) throw new Error(data.message || JSON.stringify(data));
+$('buy-btn').addEventListener('click',()=>{
+  reset(); $('cart-count').textContent='1'; page('checkout');
+});
+$('back-btn').addEventListener('click',()=>{
+  reset(); $('cart-count').textContent='0'; page('products');
+});
+async function read(res){
+  const body=await res.text();
+  let data;
+  try{data=JSON.parse(body);}catch{throw new Error(body||'Invalid API response');}
+  if(!res.ok)throw new Error(data.detail||data.message||data.error||('HTTP '+res.status));
   return data;
 }
-function addCheckoutLink(url) {
-  if (!url || $('checkout').querySelector('a')) return;
-  try { if (new URL(url).protocol !== 'https:') throw new Error('Unsafe checkout URL'); }
-  catch { $('note').textContent = 'Checkout URL không hợp lệ hoặc không phải HTTPS.'; return; }
-  const a = document.createElement('a'); a.href = url; a.target = '_blank'; a.rel = 'noopener noreferrer';
-  a.textContent = 'Mở trang thanh toán MoMo ↗'; $('checkout').appendChild(a);
-}
-async function pollPayment(id) {
-  const p = await parseResponse(await fetch(`${apiBase}/api/v1/payments/${encodeURIComponent(id)}`));
-  const state = p.status || 'PENDING';
-  if (state === 'SUCCEEDED') { setStatus('✅ Thanh toán thành công'); $('pay').disabled = false; $('pay').textContent = 'Tạo giao dịch mới'; return; }
-  if (state === 'FAILED') { setStatus('❌ Thanh toán thất bại'); $('pay').disabled = false; return; }
-  setStatus(`⏳ ${state}`); addCheckoutLink(p.checkoutUrl);
-  timer = setTimeout(() => pollPayment(id).catch(e => { setStatus('Lỗi kiểm tra trạng thái'); $('note').textContent = e.message; }), 3000);
-}
-$('pay').addEventListener('click', async () => {
-  resetCheckout(); $('pay').disabled = true;
-  if (mock) {
-    setStatus('⏳ Đang tạo giao dịch...');
-    timer = setTimeout(() => { setStatus('⏳ Chờ thanh toán MoMo (giả lập)'); $('mock-controls').hidden = false; $('note').textContent = 'Nhấn nút giả lập để chuyển sang thành công. Không có tiền thật hay API nào được gọi.'; }, 700);
-    return;
+async function poll(id,run){
+  if(run!==generation)return;
+  try{
+    const p=await read(await fetch(base+'/api/v1/payments/'+encodeURIComponent(id),{cache:'no-store'}));
+    if(run!==generation)return;
+    if(p.status==='SUCCEEDED'){
+      $('qr-area').hidden=true;
+      status('✅ Thanh toán thành công (MÔ PHỎNG)');
+      $('note').textContent='Worker đã cập nhật SUCCEEDED vào MySQL.';
+      $('pay').disabled=false; $('pay').textContent='Tạo giao dịch mới';
+      $('cart-count').textContent='0';
+      return;
+    }
+    if(p.status==='EXPIRED'){
+      $('qr-area').hidden=true;
+      status('⌛ QR hết hạn');
+      $('pay').disabled=false; $('pay').textContent='Tạo QR mới';
+      return;
+    }
+    status(p.status==='SCANNED'?'📱 Đã quét QR, Worker đang xử lý...':'⏳ Chờ quét QR...');
+    timer=setTimeout(()=>poll(id,run),2000);
+  }catch(e){
+    if(run!==generation)return;
+    status('⚠️ Mất kết nối, đang thử lại...');
+    $('note').textContent=e.message;
+    timer=setTimeout(()=>poll(id,run),3000);
   }
-  try {
-    setStatus('⏳ Đang tạo giao dịch...');
-    currentOrderId = `demo-${Date.now()}`;
-    const response = await fetch(`${apiBase}/api/v1/payments`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json', 'Idempotency-Key': `${currentOrderId}-payment-1` },
-      body: JSON.stringify({ orderId: currentOrderId, amount: 125000, currency: 'VND', method: 'MOMO' })
-    });
-    const payment = await parseResponse(response);
-    paymentId = payment.paymentId || payment.id;
-    if (!paymentId) throw new Error('API không trả về paymentId/id');
-    await pollPayment(paymentId);
-  } catch (error) { setStatus('❌ Không thể tạo giao dịch'); $('note').textContent = error.message; $('pay').disabled = false; }
+}
+$('pay').addEventListener('click',async()=>{
+  reset();
+  const run=generation;
+  $('pay').disabled=true;
+  status('⏳ Đang tạo giao dịch...');
+  try{
+    const key='demo-'+Date.now()+'-'+Math.random().toString(36).slice(2);
+    const payment=await read(await fetch(base+'/api/v1/payments',{
+      method:'POST',
+      headers:{'Content-Type':'application/json','Idempotency-Key':key},
+      body:JSON.stringify({orderId:key,amount:125000,currency:'VND',method:'QR_DEMO'})
+    }));
+    if(run!==generation)return;
+    if(!payment.paymentId||!payment.qrCodeUrl)throw new Error('API thiếu QR; hãy tạo giao dịch mới');
+    $('payment-qr').src=payment.qrCodeUrl;
+    $('qr-expiry').textContent='Hết hạn: '+new Date(payment.expiresAt).toLocaleTimeString('vi-VN');
+    $('qr-area').hidden=false;
+    $('note').textContent='Mở URL trong QR trên điện thoại. Chỉ khi mở liên kết, API mới ghi nhận SCANNED.';
+    await poll(payment.paymentId,run);
+  }catch(e){
+    if(run!==generation)return;
+    $('pay').disabled=false;
+    status('❌ Không tạo được QR');
+    $('note').textContent=e.message;
+  }
 });
-resetCheckout(); showPage(location.hash === '#checkout' ? 'checkout' : 'products');
+reset();
+page(location.hash==='#checkout'?'checkout':'products');
